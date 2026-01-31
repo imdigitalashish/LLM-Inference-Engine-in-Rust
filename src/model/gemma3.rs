@@ -17,17 +17,12 @@ impl Gemma3RmsNorm {
 
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
         let dtype = x.dtype();
-        let x = x.to_dtype(DType::F32)?;
-
-        // Compute RMS: sqrt(mean(x^2) + eps)
-        let variance = x.sqr()?.mean_keepdim(D::Minus1)?;
+        let x_f32 = x.to_dtype(DType::F32)?;
+        let variance = x_f32.sqr()?.mean_keepdim(D::Minus1)?;
         let rms = (variance + self.eps)?.sqrt()?;
-        let x_normed = x.broadcast_div(&rms)?;
-
-        // Gemma uses (1 + weight) instead of just weight
+        let x_normed = x_f32.broadcast_div(&rms)?;
         let weight = (&self.weight.to_dtype(DType::F32)? + 1.0)?;
         let result = x_normed.broadcast_mul(&weight)?;
-
         result.to_dtype(dtype)
     }
 }
@@ -84,10 +79,9 @@ impl Gemma3Config {
     }
 }
 
-// Rotary Position Embedding (HuggingFace-style split-half method)
 struct RotaryEmbedding {
-    sin: Tensor,  // [max_seq_len, dim/2]
-    cos: Tensor,  // [max_seq_len, dim/2]
+    sin: Tensor,
+    cos: Tensor,
 }
 
 impl RotaryEmbedding {
@@ -102,16 +96,23 @@ impl RotaryEmbedding {
         let positions = Tensor::new(positions, device)?.unsqueeze(1)?;
 
         let freqs = positions.broadcast_mul(&inv_freq.unsqueeze(0)?)?;
-        let sin = freqs.sin()?;
-        let cos = freqs.cos()?;
+        let sin_half = freqs.sin()?;
+        let cos_half = freqs.cos()?;
+
+        let sin = Tensor::cat(&[&sin_half, &sin_half], D::Minus1)?
+            .unsqueeze(0)?
+            .unsqueeze(0)?;
+        let cos = Tensor::cat(&[&cos_half, &cos_half], D::Minus1)?
+            .unsqueeze(0)?
+            .unsqueeze(0)?;
 
         Ok(Self { sin, cos })
     }
 
     fn apply(&self, q: &Tensor, k: &Tensor, offset: usize) -> CandleResult<(Tensor, Tensor)> {
         let seq_len = q.dim(2)?;
-        let sin = self.sin.i(offset..offset + seq_len)?;
-        let cos = self.cos.i(offset..offset + seq_len)?;
+        let sin = self.sin.i((.., .., offset..offset + seq_len, ..))?;
+        let cos = self.cos.i((.., .., offset..offset + seq_len, ..))?;
 
         let q_embed = Self::apply_rotary_emb(q, &sin, &cos)?;
         let k_embed = Self::apply_rotary_emb(k, &sin, &cos)?;
@@ -119,32 +120,12 @@ impl RotaryEmbedding {
         Ok((q_embed, k_embed))
     }
 
-    /// HuggingFace-style RoPE: split-half method
-    /// rotate_half(x) = cat(-x[..., dim/2:], x[..., :dim/2])
-    /// output = x * cos + rotate_half(x) * sin
     fn apply_rotary_emb(x: &Tensor, sin: &Tensor, cos: &Tensor) -> CandleResult<Tensor> {
-        let (b, h, seq_len, dim) = x.dims4()?;
-        let half_dim = dim / 2;
-
-        // Split x into first and second half
+        let half_dim = x.dim(D::Minus1)? / 2;
         let x1 = x.narrow(D::Minus1, 0, half_dim)?;
         let x2 = x.narrow(D::Minus1, half_dim, half_dim)?;
-
-        // rotate_half: [-x2, x1]
-        let x2_neg = x2.neg()?;
-        let x_rotated = Tensor::cat(&[x2_neg, x1], D::Minus1)?;
-
-        // Expand sin/cos to full dimension: [seq, dim/2] -> [1, 1, seq, dim]
-        let sin = sin.unsqueeze(0)?.unsqueeze(0)?;  // [1, 1, seq, dim/2]
-        let cos = cos.unsqueeze(0)?.unsqueeze(0)?;
-
-        // Duplicate sin/cos to match full dim: [1, 1, seq, dim/2] -> [1, 1, seq, dim]
-        let sin_full = Tensor::cat(&[&sin, &sin], D::Minus1)?;
-        let cos_full = Tensor::cat(&[&cos, &cos], D::Minus1)?;
-
-        // Apply: x * cos + rotate_half(x) * sin
-        let result = (x.broadcast_mul(&cos_full)? + x_rotated.broadcast_mul(&sin_full)?)?;
-        Ok(result)
+        let x_rotated = Tensor::cat(&[x2.neg()?, x1], D::Minus1)?;
+        x.broadcast_mul(cos)?.broadcast_add(&x_rotated.broadcast_mul(sin)?)
     }
 }
 
@@ -168,11 +149,9 @@ impl Gemma3MLP {
     }
 
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        let gate = self.gate_proj.forward(x)?;
-        let gate = gate.gelu_erf()?;
+        let gate = self.gate_proj.forward(x)?.gelu_erf()?;
         let up = self.up_proj.forward(x)?;
-        let hidden = (gate * up)?;
-        self.down_proj.forward(&hidden)
+        self.down_proj.forward(&(gate * up)?)
     }
 }
 
@@ -236,54 +215,49 @@ impl Gemma3Attention {
     fn forward(&mut self, x: &Tensor, position: usize) -> CandleResult<Tensor> {
         let (batch, seq_len, _) = x.dims3()?;
 
-        // Project Q, K, V
         let q = self.q_proj.forward(x)?;
         let k = self.k_proj.forward(x)?;
         let v = self.v_proj.forward(x)?;
 
-        // Reshape to [batch, heads, seq, head_dim]
         let q = q.reshape((batch, seq_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
+            .transpose(1, 2)?
+            .contiguous()?;
         let k = k.reshape((batch, seq_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
+            .transpose(1, 2)?
+            .contiguous()?;
         let v = v.reshape((batch, seq_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
+            .transpose(1, 2)?
+            .contiguous()?;
 
-        // Apply QK-Norm (per-head normalization)
         let q = self.apply_qk_norm(&q, &self.q_norm)?;
         let k = self.apply_qk_norm(&k, &self.k_norm)?;
 
-        // Apply rotary embeddings
         let (q, k) = self.rotary.apply(&q, &k, position)?;
 
-        // Update KV cache
         let (k, v) = match &self.kv_cache {
             Some((prev_k, prev_v)) => {
-                let k = Tensor::cat(&[prev_k, &k], 2)?;
-                let v = Tensor::cat(&[prev_v, &v], 2)?;
+                let k = Tensor::cat(&[prev_k, &k], 2)?.contiguous()?;
+                let v = Tensor::cat(&[prev_v, &v], 2)?.contiguous()?;
                 (k, v)
             }
             None => (k, v),
         };
         self.kv_cache = Some((k.clone(), v.clone()));
 
-        // Expand KV heads for GQA
         let k = self.repeat_kv(&k)?;
         let v = self.repeat_kv(&v)?;
 
-        // Compute attention scores
-        let scores = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
+        let k_t = k.transpose(D::Minus2, D::Minus1)?.contiguous()?;
+        let scores = q.matmul(&k_t)?;
         let scores = (scores * self.scale)?;
 
-        // Apply causal mask (and sliding window for local attention)
         let scores = self.apply_mask(&scores)?;
 
-        // Softmax and attention output
         let attn_weights = candle_nn::ops::softmax_last_dim(&scores)?;
         let attn_output = attn_weights.matmul(&v)?;
 
-        // Reshape back
         let attn_output = attn_output.transpose(1, 2)?
+            .contiguous()?
             .reshape((batch, seq_len, self.num_heads * self.head_dim))?;
 
         self.o_proj.forward(&attn_output)
@@ -309,33 +283,42 @@ impl Gemma3Attention {
 
     fn apply_mask(&self, scores: &Tensor) -> CandleResult<Tensor> {
         let (_, _, seq_len, kv_len) = scores.dims4()?;
+
+        if seq_len == 1 {
+            if self.is_global {
+                return Ok(scores.clone());
+            }
+            if kv_len <= self.sliding_window {
+                return Ok(scores.clone());
+            }
+            let device = scores.device();
+            let dtype = scores.dtype();
+            let mask_start = kv_len.saturating_sub(self.sliding_window);
+            let mut mask_vec = vec![f32::NEG_INFINITY; mask_start];
+            mask_vec.extend(vec![0f32; kv_len - mask_start]);
+            let mask = Tensor::from_vec(mask_vec, (1, 1, 1, kv_len), device)?.to_dtype(dtype)?;
+            return scores.broadcast_add(&mask);
+        }
+
         let device = scores.device();
         let dtype = scores.dtype();
+        let offset = kv_len - seq_len;
 
-        let mut mask = vec![vec![0f32; kv_len]; seq_len];
+        let mut mask = Vec::with_capacity(seq_len * kv_len);
         for i in 0..seq_len {
+            let query_abs_pos = i + offset;
             for j in 0..kv_len {
-                let query_pos = i;
-                let key_pos = j;
-
-                // Causal: can't attend to future
-                if key_pos > query_pos + (kv_len - seq_len) {
-                    mask[i][j] = f32::NEG_INFINITY;
-                }
-                // Sliding window for local attention
-                else if !self.is_global {
-                    let distance = (query_pos + (kv_len - seq_len)) as i64 - key_pos as i64;
-                    if distance > self.sliding_window as i64 {
-                        mask[i][j] = f32::NEG_INFINITY;
-                    }
+                if j > query_abs_pos {
+                    mask.push(f32::NEG_INFINITY);
+                } else if !self.is_global && (query_abs_pos - j) >= self.sliding_window {
+                    mask.push(f32::NEG_INFINITY);
+                } else {
+                    mask.push(0f32);
                 }
             }
         }
 
-        let mask: Vec<f32> = mask.into_iter().flatten().collect();
-        let mask = Tensor::from_vec(mask, (1, 1, seq_len, kv_len), device)?
-            .to_dtype(dtype)?;
-
+        let mask = Tensor::from_vec(mask, (1, 1, seq_len, kv_len), device)?.to_dtype(dtype)?;
         scores.broadcast_add(&mask)
     }
 
@@ -375,20 +358,16 @@ impl Gemma3DecoderLayer {
     }
 
     fn forward(&mut self, x: &Tensor, position: usize, _layer_idx: usize) -> CandleResult<Tensor> {
-        // Pre-norm attention
-        let residual = x;
         let normed = self.input_layernorm.forward(x)?;
         let attn_out = self.self_attn.forward(&normed, position)?;
         let attn_normed = self.post_attention_layernorm.forward(&attn_out)?;
-        let hidden_after_attn = (residual + attn_normed)?;
+        let hidden = (x + attn_normed)?.contiguous()?;
 
-        // Pre-norm MLP
-        let residual = &hidden_after_attn;
-        let ff_normed = self.pre_feedforward_layernorm.forward(&hidden_after_attn)?;
+        let ff_normed = self.pre_feedforward_layernorm.forward(&hidden)?;
         let mlp_out = self.mlp.forward(&ff_normed)?;
         let mlp_normed = self.post_feedforward_layernorm.forward(&mlp_out)?;
 
-        residual + mlp_normed
+        (&hidden + mlp_normed)?.contiguous()
     }
 
     fn clear_cache(&mut self) {
@@ -432,7 +411,11 @@ impl Gemma3Model {
             config.head_dim
         );
 
-        let dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
+        let dtype = if device.is_cuda() {
+            DType::BF16
+        } else {
+            DType::F32
+        };
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(weight_paths, dtype, device)? };
 
         info!("Building Gemma 3 model...");
@@ -472,19 +455,21 @@ impl Gemma3Model {
 
 impl LanguageModel for Gemma3Model {
     fn forward(&mut self, input_ids: &Tensor, position: usize) -> Result<Tensor> {
-        // Embed tokens with Gemma scaling
-        let mut hidden = self.embed_tokens.forward(input_ids)?;
         let scale = (self.config.hidden_size as f64).sqrt();
-        hidden = (hidden * scale)?;
+        let mut hidden = (self.embed_tokens.forward(input_ids)? * scale)?.contiguous()?;
 
-        // Run through transformer layers
         for (i, layer) in self.layers.iter_mut().enumerate() {
             hidden = layer.forward(&hidden, position, i)?;
         }
 
-        // Final norm and logits
-        hidden = self.norm.forward(&hidden)?;
-        let logits = self.lm_head.forward(&hidden)?;
+        let hidden = self.norm.forward(&hidden)?;
+        let (_batch, seq_len, _) = hidden.dims3()?;
+        let last_hidden = if seq_len > 1 {
+            hidden.narrow(1, seq_len - 1, 1)?.contiguous()?
+        } else {
+            hidden
+        };
+        let logits = self.lm_head.forward(&last_hidden)?;
 
         Ok(logits)
     }
